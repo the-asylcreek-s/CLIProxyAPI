@@ -50,6 +50,17 @@ func isClaudeWindowAllowed(status string) bool {
 	return status == "allowed" || status == "allowed_warning"
 }
 
+// isClaudeModelFamilyWeeklyClaim reports whether a representative claim names a
+// per-model-family weekly limit, which does not describe the whole credential.
+func isClaudeModelFamilyWeeklyClaim(claim string) bool {
+	switch strings.ToLower(strings.TrimSpace(claim)) {
+	case "seven_day_opus", "seven_day_sonnet":
+		return true
+	default:
+		return false
+	}
+}
+
 func isOverageOrFableOnlyRejection(headers http.Header, unifiedStatus, status5h, status7d, status7dOI string) bool {
 	if status5h == "rejected" || status7d == "rejected" {
 		return false
@@ -59,12 +70,13 @@ func isOverageOrFableOnlyRejection(headers http.Header, unifiedStatus, status5h,
 	overageDisabledReason := strings.TrimSpace(getHeaderCaseInsensitive(headers, "Anthropic-Ratelimit-Unified-Overage-Disabled-Reason"))
 	representativeClaim := strings.ToLower(strings.TrimSpace(getHeaderCaseInsensitive(headers, "Anthropic-Ratelimit-Unified-Representative-Claim")))
 
-	isOverageRejected := status7dOI == "rejected" ||
+	isModelSpecificRejection := status7dOI == "rejected" ||
 		overageStatus == "rejected" ||
 		overageDisabledReason != "" ||
-		strings.Contains(representativeClaim, "overage")
+		strings.Contains(representativeClaim, "overage") ||
+		isClaudeModelFamilyWeeklyClaim(representativeClaim)
 
-	if !isOverageRejected {
+	if !isModelSpecificRejection {
 		return false
 	}
 
@@ -75,12 +87,17 @@ func isOverageOrFableOnlyRejection(headers http.Header, unifiedStatus, status5h,
 		return true
 	}
 
-	// When Anthropic evaluates an overage-only or 7d_oi claim, it often omits
-	// the 5h status header while 5h utilization is 0.00 (or vice versa).
-	// Require an explicit, valid non-negative utilization below 1.0 before
-	// treating the unmentioned window as healthy.
+	// When Anthropic evaluates an overage-only, 7d_oi, or model-family weekly
+	// claim, it often omits the 5h status header while 5h utilization is 0.00
+	// (or vice versa). A present utilization must be valid, non-negative and
+	// below 1.0. When a model-specific window (Fable 7d_oi or a model-family
+	// weekly claim) is the rejected one and 7d is explicitly allowed, Anthropic
+	// omits every 5h header if the account has no session usage yet (issue
+	// #7197), so absence counts as healthy for that shape only.
 	if shared7dAllowed && status5h == "" {
-		if isClaudeUtilizationHealthy(getHeaderCaseInsensitive(headers, "Anthropic-Ratelimit-Unified-5h-Utilization")) {
+		util5h := getHeaderCaseInsensitive(headers, "Anthropic-Ratelimit-Unified-5h-Utilization")
+		modelWindowRejected := status7dOI == "rejected" || isClaudeModelFamilyWeeklyClaim(representativeClaim)
+		if (modelWindowRejected && strings.TrimSpace(util5h) == "") || isClaudeUtilizationHealthy(util5h) {
 			return true
 		}
 	}
