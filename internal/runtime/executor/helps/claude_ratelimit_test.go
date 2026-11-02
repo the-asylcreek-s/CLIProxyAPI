@@ -344,7 +344,8 @@ func TestClaudeHeadersIndicateUnifiedRateLimitRejection_OverageRejection_Utiliza
 	}{
 		{name: "healthy zero utilization", utilization: "0.00", wantUnified: false},
 		{name: "healthy partial utilization", utilization: "0.50", wantUnified: false},
-		{name: "missing utilization", utilization: "", wantUnified: true},
+		// Issue #7197: with 7d explicitly allowed, absent 5h headers mean no session usage.
+		{name: "missing utilization", utilization: "", wantUnified: false},
 		{name: "invalid text", utilization: "invalid", wantUnified: true},
 		{name: "NaN", utilization: "NaN", wantUnified: true},
 		{name: "+Inf", utilization: "+Inf", wantUnified: true},
@@ -543,6 +544,107 @@ func TestAllowedUnifiedOverageClaimKeepsShortRetryAfter_Issue6465(t *testing.T) 
 					gotDesc = got.String()
 				}
 				t.Fatalf("cooldown = %s, want 30s; a short Retry-After must survive when unified status is not rejected", gotDesc)
+			}
+		})
+	}
+}
+
+// Issue #7197: a Fable-only weekly rejection with 7d allowed and no 5h headers
+// must stay model-scoped instead of benching the credential for ~6 days.
+func TestFableOnlyRejectionWithoutFiveHourHeadersStaysModelScoped_Issue7197(t *testing.T) {
+	now := time.Unix(1793603466, 0)
+	headers := http.Header{
+		"Retry-After":                                         []string{"546534"},
+		"Anthropic-Ratelimit-Unified-Status":                  []string{"rejected"},
+		"Anthropic-Ratelimit-Unified-Representative-Claim":    []string{"seven_day_overage_included"},
+		"Anthropic-Ratelimit-Unified-7d-Status":               []string{"allowed"},
+		"Anthropic-Ratelimit-Unified-7d-Utilization":          []string{"0.62"},
+		"Anthropic-Ratelimit-Unified-7d-Reset":                []string{"1794150000"},
+		"Anthropic-Ratelimit-Unified-7d_oi-Status":            []string{"rejected"},
+		"Anthropic-Ratelimit-Unified-7d_oi-Utilization":       []string{"1.0"},
+		"Anthropic-Ratelimit-Unified-7d_oi-Reset":             []string{"1794150000"},
+		"Anthropic-Ratelimit-Unified-Overage-Status":          []string{"rejected"},
+		"Anthropic-Ratelimit-Unified-Overage-Disabled-Reason": []string{"out_of_credits"},
+		"Anthropic-Ratelimit-Unified-Reset":                   []string{"1794150000"},
+	}
+
+	if ClaudeHeadersIndicateUnifiedRateLimitRejection(headers) {
+		t.Fatal("Fable-only rejection with 7d allowed and no 5h headers was treated as credential-scoped")
+	}
+	if got := parseClaudeRateLimitResetWithFuzz(headers, now, 0, 0); got != nil {
+		t.Fatalf("cooldown = %v, want nil; the credential-wide Retry-After must not apply", *got)
+	}
+}
+
+func TestClaudeHeadersIndicateUnifiedRateLimitRejection_ModelFamilyWeeklyClaims(t *testing.T) {
+	now := time.Now()
+	tests := []struct {
+		name        string
+		headers     http.Header
+		wantUnified bool
+	}{
+		{
+			name: "seven_day_opus with 5h and 7d allowed is model-scoped",
+			headers: http.Header{
+				"Anthropic-Ratelimit-Unified-Status":               []string{"rejected"},
+				"Anthropic-Ratelimit-Unified-Representative-Claim": []string{"seven_day_opus"},
+				"Anthropic-Ratelimit-Unified-5h-Status":            []string{"allowed"},
+				"Anthropic-Ratelimit-Unified-7d-Status":            []string{"allowed"},
+				"Anthropic-Ratelimit-Unified-Reset":                []string{strconv.FormatInt(now.Add(7*24*time.Hour).Unix(), 10)},
+				"Retry-After":                                      []string{"604800"},
+			},
+			wantUnified: false,
+		},
+		{
+			name: "seven_day_sonnet with 7d allowed and 5h omitted is model-scoped",
+			headers: http.Header{
+				"Anthropic-Ratelimit-Unified-Status":               []string{"rejected"},
+				"Anthropic-Ratelimit-Unified-Representative-Claim": []string{" Seven_Day_Sonnet "},
+				"Anthropic-Ratelimit-Unified-7d-Status":            []string{"allowed"},
+			},
+			wantUnified: false,
+		},
+		{
+			name: "seven_day_opus with exhausted 5h utilization is credential-scoped",
+			headers: http.Header{
+				"Anthropic-Ratelimit-Unified-Status":               []string{"rejected"},
+				"Anthropic-Ratelimit-Unified-Representative-Claim": []string{"seven_day_opus"},
+				"Anthropic-Ratelimit-Unified-7d-Status":            []string{"allowed"},
+				"Anthropic-Ratelimit-Unified-5h-Utilization":       []string{"1.0"},
+			},
+			wantUnified: true,
+		},
+		{
+			name: "seven_day_opus with 7d rejected is credential-scoped",
+			headers: http.Header{
+				"Anthropic-Ratelimit-Unified-Status":               []string{"rejected"},
+				"Anthropic-Ratelimit-Unified-Representative-Claim": []string{"seven_day_opus"},
+				"Anthropic-Ratelimit-Unified-5h-Status":            []string{"allowed"},
+				"Anthropic-Ratelimit-Unified-7d-Status":            []string{"rejected"},
+			},
+			wantUnified: true,
+		},
+		{
+			name: "plain seven_day claim is credential-scoped",
+			headers: http.Header{
+				"Anthropic-Ratelimit-Unified-Status":               []string{"rejected"},
+				"Anthropic-Ratelimit-Unified-Representative-Claim": []string{"seven_day"},
+				"Anthropic-Ratelimit-Unified-5h-Status":            []string{"allowed"},
+				"Anthropic-Ratelimit-Unified-7d-Status":            []string{"allowed"},
+			},
+			wantUnified: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := ClaudeHeadersIndicateUnifiedRateLimitRejection(tt.headers); got != tt.wantUnified {
+				t.Fatalf("ClaudeHeadersIndicateUnifiedRateLimitRejection() = %v, want %v", got, tt.wantUnified)
+			}
+			if !tt.wantUnified {
+				if got := parseClaudeRateLimitResetWithFuzz(tt.headers, now, 0, 0); got != nil {
+					t.Fatalf("cooldown = %v, want nil for a model-scoped claim", *got)
+				}
 			}
 		})
 	}
